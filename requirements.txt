@@ -1,4 +1,4 @@
-playwright
+playwright==1.54.0
 fastapi
 uvicorn
 jinja2

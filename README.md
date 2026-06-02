@@ -10,6 +10,32 @@ A simple web service that converts HTML/templates to images, with image lifecycl
 
 - `PORT`: Service port, default is 8999
 - `IMAGE_LIFETIME_HOURS`: Image lifetime in hours, default is 24 hours. Images older than this will be automatically cleaned up
+- `T2I_RENDER_WAIT_UNTIL`: Playwright navigation wait state, default is `domcontentloaded`. Valid values: `commit`, `domcontentloaded`, `load`, `networkidle`
+- `T2I_SKIP_FONT_READY`: Whether to skip Playwright's internal `document.fonts.ready` wait before screenshots, default is `true`. This is a rendering stability fallback for slow or blocked remote fonts
+- `RATE_LIMIT_MAX_REQUESTS`: Maximum requests allowed in each rate-limit window, disabled by default
+- `RATE_LIMIT_WINDOW_SECONDS`: Rate-limit window size in seconds, disabled by default
+
+## Smoke Test
+
+After installing Playwright browsers, run a local Chinese/Emoji render smoke test:
+
+```bash
+python scripts/render_smoke.py
+```
+
+To exercise fallback behavior when a remote font URL is unreachable:
+
+```bash
+python scripts/render_smoke.py --remote-font-probe
+```
+
+To fail when the expected Noto CJK / Emoji fonts are not visible to fontconfig, use:
+
+```bash
+python scripts/render_smoke.py --require-fonts
+```
+
+The smoke test verifies that the rendering path completes and that expected fonts are installed when `--require-fonts` is used. It does not perform pixel-level glyph quality checks.
 
 ## API Endpoints
 
@@ -36,15 +62,16 @@ Convert HTML to image
   - viewport_width (int, optional): Custom viewport width to control screenshot width. Resolved in priority order:
     1. Explicitly set in request options
     2. Auto-parsed from `<meta name="viewport" content="width=...">` in HTML
-    3. Defaults to 800px if not specified and no meta tag found
+    3. Uses Playwright's context default viewport if width and height are not both available
   - viewport_height (int, optional): Custom viewport height to control screenshot height. Resolved in priority order:
     1. Explicitly set in request options
     2. Auto-parsed from `<meta name="viewport" content="height=...">` in HTML
-    3. Defaults to 720px if not specified and no meta tag found
+    3. Uses Playwright's context default viewport if width and height are not both available
   - device_scale_factor_level (Literal["normal", "high", "ultra"], optional): Device pixel ratio level, default is "normal". Different levels use independent browser context pools for better performance and resource isolation.
     - `normal`: Device pixel ratio 1.0 (default)
     - `high`: Device pixel ratio 1.3
     - `ultra`: Device pixel ratio 1.8
+  - wait_until (Literal["commit", "domcontentloaded", "load", "networkidle"], optional): Playwright navigation wait state. Defaults to `T2I_RENDER_WAIT_UNTIL` when omitted
 
 ### GET /text2img/data/{id}
 
