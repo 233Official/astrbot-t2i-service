@@ -6,8 +6,11 @@ on:
       - main
     paths:
       - 'Dockerfile'
+      - '.dockerignore'
       - 'docker-compose.yml'
+      - 'requirements.txt'
       - 'src/**'
+      - 'scripts/**'
       - '.github/workflows/build-latest-image.yaml'
       - 'main.py'
   workflow_dispatch:

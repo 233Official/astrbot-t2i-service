@@ -1,30 +1,14 @@
-from render import Text2ImgRender, ScreenshotOptions
-import requests
+from __future__ import annotations
 
-def main():
-    render = Text2ImgRender()
-    template = """<html><head><meta name="viewport" content="width=device-width,initial-scale=1.0"></head><body><h1>{{ title }}😤</h1><p>{{ content }}</p></body></html>"""
-    data = {"title": "Hello, World!", "content": "This is a test."}
-    html = render.from_jinja_template(template, data)
-    pic = render.html2pic(html, ScreenshotOptions(type="jpeg", full_page=True))
-
-    print(f"Rendered HTML to {pic}")
+import subprocess
+import sys
+from pathlib import Path
 
 
-def test_api():
-    url = "http://localhost:8000/text2img/generate"
-    data = {
-        "html": "<html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0\"></head><body><h1>Hello, World!😤</h1><p>This is a test.</p></body></html>",
-        "options": {
-            "type": "jpeg",
-            "full_page": True
-        },
-        "json": False
-    }
-    response = requests.post(url, json=data)
-    print(response.json())
+def main() -> int:
+    smoke_script = Path(__file__).resolve().parents[1] / "scripts" / "render_smoke.py"
+    return subprocess.call([sys.executable, str(smoke_script), *sys.argv[1:]])
 
 
 if __name__ == "__main__":
-    # main()
-    test_api()
+    raise SystemExit(main())

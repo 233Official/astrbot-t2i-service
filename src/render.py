@@ -1,3 +1,4 @@
+import os
 import re
 
 from .util import generate_data_path
@@ -5,10 +6,56 @@ from playwright.async_api import async_playwright
 from jinja2.sandbox import SandboxedEnvironment
 from pydantic import BaseModel
 from typing_extensions import TypedDict
-from typing import Literal
+from typing import Literal, cast
 from loguru import logger
 from playwright.async_api import BrowserContext, Browser, Playwright
 from playwright._impl._errors import TargetClosedError
+
+WaitUntil = Literal["commit", "domcontentloaded", "load", "networkidle"]
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"", "0", "false", "no", "off"}:
+        return False
+
+    logger.warning("Invalid {} value {!r}; falling back to {}", name, value, default)
+    return default
+
+
+def _env_wait_until() -> WaitUntil:
+    value = os.getenv("T2I_RENDER_WAIT_UNTIL", "domcontentloaded").strip().lower()
+    valid_wait_until = {"commit", "domcontentloaded", "load", "networkidle"}
+    if value in valid_wait_until:
+        return cast(WaitUntil, value)
+
+    logger.warning(
+        "Invalid T2I_RENDER_WAIT_UNTIL value {!r}; falling back to domcontentloaded",
+        value,
+    )
+    return "domcontentloaded"
+
+
+DEFAULT_RENDER_WAIT_UNTIL = _env_wait_until()
+SKIP_FONT_READY = _env_flag("T2I_SKIP_FONT_READY", True)
+
+# Playwright waits for document.fonts.ready before screenshotting. In server-side
+# rendering, slow or blocked remote fonts can make page.screenshot() time out even
+# after DOM is ready. This internal Playwright switch skips that font-ready wait.
+# It must be set before the Playwright driver starts.
+if SKIP_FONT_READY:
+    os.environ.setdefault("PW_TEST_SCREENSHOT_NO_FONTS_READY", "1")
+
+
+class RenderError(RuntimeError):
+    def __init__(self, stage: str, message: str):
+        super().__init__(message)
+        self.stage = stage
 
 
 class FloatRect(TypedDict):
@@ -41,21 +88,23 @@ class ScreenshotOptions(BaseModel):
             优先级：
             1. 显式指定此参数；
             2. 从 HTML 的 <meta name="viewport" content="width=..."> 自动解析；
-            3. 未指定时默认为 800px.
+            3. 未指定或未同时得到宽高时，使用 Playwright 上下文默认视口.
         viewport_height: (int, optional): 自定义视口高度，用于控制截图高度.
             优先级：
             1. 显式指定此参数；
             2. 从 HTML 的 <meta name="viewport" content="height=..."> 自动解析；
-            3. 未指定时默认为 720px.
+            3. 未指定或未同时得到宽高时，使用 Playwright 上下文默认视口.
         device_scale_factor_level: (Literal["normal", "high", "ultra"], optional): 设备像素比等级.
             - normal: 1.0
             - high: 1.3
             - ultra: 1.8
+        wait_until: (Literal["commit", "domcontentloaded", "load", "networkidle", None], optional): 页面导航等待状态；None 表示使用服务默认值，服务默认值由 T2I_RENDER_WAIT_UNTIL 配置，未配置时为 domcontentloaded.
 
     @author: Redlnn(https://github.com/GraiaCommunity/graiax-text2img-playwright)
     """
 
     timeout: float | None = None
+    wait_until: WaitUntil | None = DEFAULT_RENDER_WAIT_UNTIL
     type: Literal["jpeg", "png", None] = None
     quality: int | None = None
     omit_background: bool | None = None
@@ -82,6 +131,14 @@ class Text2ImgRender:
         self.browser: Browser | None = None
         # Context pool: {"normal": context, "high": context, "ultra": context}
         self.contexts: dict[str, BrowserContext] = {}
+        logger.info(
+            "Text2ImgRender config: "
+            f"default_wait_until={DEFAULT_RENDER_WAIT_UNTIL}, "
+            f"skip_font_ready={SKIP_FONT_READY}"
+        )
+
+    def _resolve_wait_until(self, wait_until: WaitUntil | None) -> WaitUntil:
+        return wait_until or DEFAULT_RENDER_WAIT_UNTIL
 
     async def _ensure_context(self, level: str = "normal") -> BrowserContext:
         """Ensure that Playwright, Browser and BrowserContext are initialized.
@@ -131,7 +188,7 @@ class Text2ImgRender:
         return html_file_path, abs_path
 
     def _resolve_viewport_size(
-            self, html_file_path: str, screenshot_options: ScreenshotOptions
+        self, html_file_path: str, screenshot_options: ScreenshotOptions
     ) -> tuple[int | None, int | None]:
         """根据截图参数与 HTML 内容推断 viewport 大小（宽, 高）。
 
@@ -204,7 +261,7 @@ class Text2ImgRender:
             self.playwright = None
 
     async def html2pic(
-            self, html_file_path: str, screenshot_options: ScreenshotOptions
+        self, html_file_path: str, screenshot_options: ScreenshotOptions
     ) -> str:
         # Determine which context to use based on device_scale_factor_level
         level = screenshot_options.device_scale_factor_level or "normal"
@@ -229,23 +286,114 @@ class Text2ImgRender:
             context = await self._ensure_context(level)
             page = await context.new_page()
 
+        def _truncate(value: str | None, limit: int = 300) -> str:
+            if value is None:
+                return ""
+            return value if len(value) <= limit else f"{value[:limit]}..."
+
+        def _sanitize_url(url: str | None) -> str:
+            if not url:
+                return ""
+            # Avoid logging query strings or fragments because they may contain tokens.
+            safe_url = url.split("?", 1)[0].split("#", 1)[0]
+            return _truncate(safe_url)
+
+        def _request_failure_reason(request) -> str:
+            failure = getattr(request, "failure", "")
+            if callable(failure):
+                failure = failure()
+            if failure is None:
+                return "no_detail"
+            return _truncate(str(failure))
+
+        def _log_render_event(event: str, log_level: str = "warning", **kwargs) -> None:
+            log_func = getattr(logger, log_level, logger.warning)
+            log_func(
+                "html2pic page event: "
+                f"event={event}, html_file_path={html_file_path}, "
+                f"timeout={screenshot_options.timeout}, "
+                f"wait_until={self._resolve_wait_until(screenshot_options.wait_until)}, "
+                f"full_page={screenshot_options.full_page}, type={screenshot_options.type}, "
+                f"device_scale_factor_level={level}, details={kwargs}"
+            )
+
+        page.on(
+            "requestfailed",
+            lambda request: _log_render_event(
+                "requestfailed",
+                url=_sanitize_url(getattr(request, "url", None)),
+                failure=_request_failure_reason(request),
+            ),
+        )
+        page.on(
+            "response",
+            lambda response: (
+                _log_render_event(
+                    "response_error",
+                    log_level="info",
+                    status=getattr(response, "status", None),
+                    url=_sanitize_url(getattr(response, "url", None)),
+                )
+                if getattr(response, "status", 0) >= 400
+                else None
+            ),
+        )
+        page.on(
+            "pageerror",
+            lambda error: _log_render_event("pageerror", message=_truncate(str(error))),
+        )
+        page.on(
+            "console",
+            lambda msg: (
+                _log_render_event(
+                    "console",
+                    log_level="warning"
+                    if getattr(msg, "type", None) == "error"
+                    else "info",
+                    type=getattr(msg, "type", None),
+                    message=_truncate(getattr(msg, "text", None)),
+                )
+                if getattr(msg, "type", None) in {"warning", "error"}
+                else None
+            ),
+        )
+
         viewport_width, viewport_height = self._resolve_viewport_size(
             html_file_path, screenshot_options
         )
 
         width = viewport_width if viewport_width is not None else 800
         height = viewport_height if viewport_height is not None else 720
-        # Set viewport size if either width or height is specified
+        # Set viewport size only when both width and height are available.
         if viewport_width is not None and viewport_height is not None:
             # Default values if one dimension not specified
             await page.set_viewport_size({"width": width, "height": height})
             logger.info(f"html2pic: set viewport size to {width}x{height}")
 
         try:
-            await page.goto(
-                f"file://{html_file_path}", timeout=screenshot_options.timeout
+            wait_until = self._resolve_wait_until(screenshot_options.wait_until)
+            logger.info(
+                "html2pic goto start: "
+                f"html_file_path={html_file_path}, timeout={screenshot_options.timeout}, "
+                f"wait_until={wait_until}, full_page={screenshot_options.full_page}, "
+                f"type={screenshot_options.type}, device_scale_factor_level={level}"
             )
+            try:
+                await page.goto(
+                    f"file://{html_file_path}",
+                    timeout=screenshot_options.timeout,
+                    wait_until=wait_until,
+                )
+            except Exception as e:
+                logger.exception(
+                    "html2pic goto failed: "
+                    f"html_file_path={html_file_path}, timeout={screenshot_options.timeout}, "
+                    f"wait_until={wait_until}, full_page={screenshot_options.full_page}, "
+                    f"type={screenshot_options.type}, device_scale_factor_level={level}"
+                )
+                raise RenderError("goto", f"page.goto failed: {e}") from e
             screenshot_kwargs = screenshot_options.model_dump(exclude_none=True)
+            screenshot_kwargs.pop("wait_until", None)
             screenshot_kwargs.pop("viewport_width", None)
             screenshot_kwargs.pop("viewport_height", None)
             screenshot_kwargs.pop("device_scale_factor_level", None)
@@ -254,10 +402,28 @@ class Text2ImgRender:
             if screenshot_options.type == "png":
                 screenshot_kwargs.pop("quality", None)
 
-            await page.screenshot(path=result_path, **screenshot_kwargs)
+            logger.info(
+                "html2pic screenshot start: "
+                f"html_file_path={html_file_path}, timeout={screenshot_options.timeout}, "
+                f"wait_until={wait_until}, full_page={screenshot_options.full_page}, "
+                f"type={screenshot_options.type}, device_scale_factor_level={level}"
+            )
+            try:
+                await page.screenshot(path=result_path, **screenshot_kwargs)
+            except Exception as e:
+                logger.exception(
+                    "html2pic screenshot failed: "
+                    f"html_file_path={html_file_path}, timeout={screenshot_options.timeout}, "
+                    f"wait_until={wait_until}, full_page={screenshot_options.full_page}, "
+                    f"type={screenshot_options.type}, device_scale_factor_level={level}"
+                )
+                raise RenderError("screenshot", f"page.screenshot failed: {e}") from e
         finally:
             # Ensure the page is closed to free resources
-            await page.close()
+            try:
+                await page.close()
+            except Exception as e:
+                logger.debug(f"html2pic: close page failed: {e}")
 
         logger.info(f"Rendered {html_file_path} to {result_path}")
 

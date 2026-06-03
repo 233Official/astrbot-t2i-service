@@ -68,9 +68,7 @@ async def enforce_rate_limit() -> int | None:
         ):
             rate_limit_timestamps.popleft()
         if len(rate_limit_timestamps) >= rate_limit_max_requests:
-            retry_after = rate_limit_window_seconds - (
-                now - rate_limit_timestamps[0]
-            )
+            retry_after = rate_limit_window_seconds - (now - rate_limit_timestamps[0])
             return max(0, int(retry_after) + 1)
         rate_limit_timestamps.append(now)
     return None
@@ -152,7 +150,32 @@ async def text2img(request: GenerateRequest):
         )
     )
 
-    pic = await render.html2pic(abs_path, options)
+    try:
+        pic = await render.html2pic(abs_path, options)
+    except Exception as e:
+        try:
+            options_dump = options.model_dump(exclude_none=True)
+        except Exception as dump_error:
+            logger.warning(f"failed to dump screenshot options: {dump_error}")
+            options_dump = {}
+        return_mode = "json" if is_json_return else "file"
+        logger.exception(
+            "render failed: "
+            f"abs_path={abs_path}, options={options_dump}, return_mode={return_mode}"
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "code": 1,
+                "message": f"render error: {str(e)}",
+                "data": {
+                    "error_type": type(e).__name__,
+                    "stage": getattr(e, "stage", None),
+                    "html_file": os.path.basename(abs_path),
+                    "options": options_dump,
+                },
+            },
+        )
 
     media_type = "image/png" if pic.endswith(".png") else "image/jpeg"
 
