@@ -163,3 +163,6 @@ cache.json
 /tests
 
 data/
+
+# Local OpenCode workspace files
+.opencode/
